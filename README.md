@@ -55,10 +55,10 @@ venv/                     Python-Umgebung (nicht im Repo)
 ### Projekt
 
 - Free-Plan, Region `eu-west-3` (Paris).
-- **Buckets**, beide privat:
+- **Buckets** `audio` und `sheet_music` in Supabase Storage: nicht mehr in Gebrauch. Seit `20261115180000_r2_dev_checks` gibt es keine Policies mehr auf `storage.objects`, über die API kommt niemand an die alten Dateien. Die Dateien liegen in Cloudflare R2 (siehe [Storage-Worker](#storage-worker-cloudflare-r2)):
   - `audio` (`audio/mpeg`): Playbacks und Einzähler
   - `sheet_music` (`application/pdf`): Noten
-  - Dateien heißen `<uuid>.mp3` bzw. `<uuid>.pdf`. Im Free-Plan ist eine Datei höchstens 50 MB groß.
+  - Dateien heißen `<uuid>.mp3` bzw. `<uuid>.pdf`.
 - **Vault-Secret `ntfy_topic`:** Topic für die Benachrichtigung bei neuen und geänderten Songs. Fehlt es, schlägt jedes Anlegen und Ändern eines Songs fehl (außer wenn sich nur Verlag oder Link ändern).
 - **Extensions:** `moddatetime` (pflegt `updated_at`), `pg_cron` (wartende Änderungen übernehmen), `pg_net` (ntfy).
 - **Admin:** Der Account des Geschäftspartners steht in `admin`. Phil arbeitet direkt im Dashboard. Die Entwicklerseite meldet sich mit einem Admin-Account an (`ADMIN_EMAIL` in ihrer `.env`). Ihr Board liegt nicht in Supabase, sondern auf dem Pi (siehe README von `zamaric-toolchain` → „Entwicklerseite“).
@@ -87,6 +87,7 @@ Das Schema steht als SQL in `supabase/migrations/`. Jede Migration wird einmal i
 | `20261106120000_dev_site` | Entwicklerseite: `notification` mit `send_ntfy()` als einziger Quelle, `notification_feed()`, Prüf- und Übersichtsfunktionen (`integrity_report()`, `missing_files()`, `storage_usage()`, `largest_files()`, `pending_releases()`, `cron_runs()`) |
 | `20261106180000_integrity_tuning` | `integrity_report()`: „Song ohne Noten“ entfällt, doppelte Noten nur noch bei mehreren doppelten Dateien in einem Song oder derselben Datei in verschiedenen Songs |
 | `20261115120000_r2_storage` | Dateien in Cloudflare R2: `is_admin()` für den Storage-Worker, `unused_files(files)` prüft eine Dateiliste aus R2 statt `storage.objects` |
+| `20261115180000_r2_dev_checks` | Prüfungen der Entwicklerseite mit Dateiliste aus R2 (`integrity_report(files)` mit neuen Prüfungen `file_unknown` und `file_empty`, `missing_files(files)`, `storage_usage(files)`, `largest_files(files, max_rows)`), alte Fassungen ohne Liste und `unused_files()` entfernt, alle Policies auf `storage.objects` entfernt |
 
 ### Datenmodell
 
@@ -288,9 +289,9 @@ RLS ist auf jeder Tabelle an. Ohne Anmeldung (`anon`) sieht man nichts.
 | `user_instrument` | eigene lesen, hinzufügen, entfernen | wie Angemeldete |
 | `admin` | nichts | nichts |
 | `notification` | nichts | lesen |
-| Buckets `audio`, `sheet_music` | nur Dateien sichtbarer Zeilen freigegebener Songs lesen | lesen, hinzufügen, unbenutzte Dateien löschen |
+| Dateien in R2 (über den Storage-Worker) | jede Datei lesen | lesen, hochladen, auflisten, unbenutzte Dateien löschen |
 
-- Ändern oder Löschen von Inhalten darf niemand direkt über die API. Admins ändern Songs nur über `update_song()`, die selbst prüft, was erlaubt ist. Alles andere macht Phil im Dashboard oder SQL-Editor, Dateien im Bucket separat über Storage.
+- Ändern oder Löschen von Inhalten darf niemand direkt über die API. Admins ändern Songs nur über `update_song()`, die selbst prüft, was erlaubt ist. Alles andere macht Phil im Dashboard oder SQL-Editor, Dateien in R2 nur über den Storage-Worker.
 - **Unbenutzte Dateien** (`private.file_is_unused()`): keine Zeile zeigt auf sie (auch keine wartende), der Name hat die Form `<uuid>.mp3` / `<uuid>.pdf`, und sie ist älter als eine Stunde. Nur solche Dateien dürfen Admins löschen. So erwischt das Aufräumen nie eine Datei, die gerade erst hochgeladen wird.
 - Kategorien, Level, Instrumente und Stimmen pflegt nur Phil.
 - Hilfsfunktionen liegen im Schema `private` und sind nicht über die API aufrufbar: `is_admin()`, `is_clean_name()`, `song_is_pending()`, `song_is_approved()`, `playback_is_pending()`, `playback_is_approved()`, `file_is_approved()`, `file_is_unused()`, `release_time()`, `send_ntfy()`, `apply_song_changes()`, `apply_due_song_changes()`, `file_rows()` (alle Datei-Zeilen mit Bucket, für die Prüfungen der Entwicklerseite).
@@ -341,19 +342,19 @@ select private.apply_song_changes(…);  -- Song-ID
 
 **`set_file_sha256(kind, row_id, hash)`**: trägt die Prüfsumme einer alten Datei nach (`kind` = `count_in`, `playback` oder `sheet_music`). Nur für Admins, überschreibt nie eine vorhandene.
 
-**`unused_files()`**: Liste (`bucket`, `name`) der Dateien, die Admins löschen dürfen (siehe [Rechte](#rechte-rls)). Für Nicht-Admins leer.
+**`unused_files(files)`**: Aus einer Dateiliste von R2 (`[{"bucket", "name", "uploaded_at"}]`, wie sie `GET /list/<bucket>` des Storage-Workers liefert) die Dateien (`bucket`, `name`), die als unbenutzt gelöscht werden dürfen (siehe [Rechte](#rechte-rls)). Für Nicht-Admins leer.
 
 ### Funktionen der Entwicklerseite
 
-Aus `20261106120000_dev_site` (`integrity_report()` in der Fassung aus `20261106180000_integrity_tuning`), aufgerufen von Container 2 der Entwicklerseite (siehe README von `zamaric-toolchain` → „Entwicklerseite“). Ausführen darf sie nur `authenticated`, jede prüft zuerst `private.is_admin()` und wirft sonst `forbidden`. Sie lesen nur, laufen als Besitzer (`security definer`, `search_path ''`) und lesen `storage.objects` höchstens. Gelöscht wird im Bucket nie per SQL, nur über die Storage-API.
+Aus `20261106120000_dev_site`, die Prüfungen auf Dateien in der Fassung aus `20261115180000_r2_dev_checks`, aufgerufen von Container 2 der Entwicklerseite (siehe README von `zamaric-toolchain` → „Entwicklerseite“). Ausführen darf sie nur `authenticated`, jede prüft zuerst `private.is_admin()` und wirft sonst `forbidden`. Sie lesen nur und laufen als Besitzer (`security definer`, `search_path ''`). `files` ist die Dateiliste aus R2 im Format von `GET /list/<bucket>` des Storage-Workers (`[{"bucket", "name", "bytes", "uploaded_at"}]`). Gelöscht wird in R2 nie per SQL, nur über den Storage-Worker.
 
 | Funktion | Gibt zurück |
 |---|---|
 | `notification_feed(max_rows = 200)` | Nachrichten, neueste zuerst, mit `status_code` aus `net._http_response` (null, solange keine Antwort da ist oder nach 6 Stunden). Höchstens 1000 |
-| `integrity_report()` | Funde (`check_name`, `severity`, `table_name`, `row_id`, `song_id`, `song_name`, `detail`), Liste im README von `zamaric-toolchain` → „Bereiche der Website“ |
-| `missing_files()` | Zeilen, deren Datei im Bucket fehlt. Wartende Playbacks ohne eigene MP3 zählen nicht |
-| `storage_usage()` | je Bucket Zahl und Größe der Dateien (`metadata.size`) |
-| `largest_files(max_rows = 20)` | größte Dateien mit Tabelle und Song der Zeile, die auf sie zeigt (null = unbenutzt). Höchstens 200 |
+| `integrity_report(files)` | Funde (`check_name`, `severity`, `table_name`, `row_id`, `song_id`, `song_name`, `detail`), Liste im README von `zamaric-toolchain` → „Bereiche der Website“ |
+| `missing_files(files)` | Zeilen, deren Datei in R2 fehlt. Wartende Playbacks ohne eigene MP3 zählen nicht |
+| `storage_usage(files)` | je Bucket Zahl und Größe der Dateien in R2 |
+| `largest_files(files, max_rows = 20)` | größte Dateien in R2 mit Tabelle und Song der Zeile, die auf sie zeigt (null = unbenutzt). Höchstens 200 |
 | `pending_releases()` | wartende neue Songs und Songs mit wartenden Änderungen, mit Zahl der Einzähler, Playbacks und Noten (bei neuen Songs alle, sonst nur die wartenden) |
 | `cron_runs(max_rows = 50)` | letzte Läufe aller Cron-Jobs aus `cron.job_run_details`. Höchstens 500 |
 
