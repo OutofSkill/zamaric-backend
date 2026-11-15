@@ -86,6 +86,7 @@ Das Schema steht als SQL in `supabase/migrations/`. Jede Migration wird einmal i
 | `20261102120000_content_version` | `content_version()`: md5-Fingerabdruck über alle Zeilen, die der Account sehen darf (`security invoker`, die Lese-Policies gelten). Die App lädt die Tabellen nur, wenn er sich ändert |
 | `20261106120000_dev_site` | Entwicklerseite: `notification` mit `send_ntfy()` als einziger Quelle, `notification_feed()`, Prüf- und Übersichtsfunktionen (`integrity_report()`, `missing_files()`, `storage_usage()`, `largest_files()`, `pending_releases()`, `cron_runs()`) |
 | `20261106180000_integrity_tuning` | `integrity_report()`: „Song ohne Noten“ entfällt, doppelte Noten nur noch bei mehreren doppelten Dateien in einem Song oder derselben Datei in verschiedenen Songs |
+| `20261115120000_r2_storage` | Dateien in Cloudflare R2: `is_admin()` für den Storage-Worker, `unused_files(files)` prüft eine Dateiliste aus R2 statt `storage.objects` |
 
 ### Datenmodell
 
@@ -381,11 +382,16 @@ Der Bucket-Name in der Adresse ist der von Supabase (`audio`, `sheet_music`), da
 |---|---|
 | `GET` / `HEAD /<bucket>/<pfad>` | Liefert die Datei, mit `Range` (Teilabrufe fürs Streamen, Antwort `206`) und `If-None-Match` (`304`). Erlaubt mit gültigem Supabase-Login im Header `Authorization: Bearer <token>` oder mit gültiger Signatur (`?expires=…&signature=…`) |
 | `POST /sign` | Body `{"bucket": "audio", "paths": ["…"], "expiresIn": 43200}`. Nur mit gültigem Login. Gibt `{"urls": [{"path", "url", "expiresAt"}]}` zurück. Höchstens 100 Pfade, höchstens 12 Stunden gültig |
+| `PUT /<bucket>/<name>` | Nur für Admins. Lädt eine Datei hoch, Name `<uuid>.mp3` in `audio` bzw. `<uuid>.pdf` in `sheet_music`, sonst `400` (noch vor der Login-Prüfung). Den Content-Type setzt der Worker. Antwortet `201` mit `{"name", "bytes"}`, `409`, wenn die Datei schon existiert (nie überschreiben), `411` ohne `Content-Length` oder bei leerer Datei. Pflicht ist der Header `X-Content-SHA256` mit der SHA-256 der Datei (64 Hex-Zeichen, sonst `400`). R2 prüft sie beim Speichern und lehnt eine abweichende Datei ab (`502`). Höchstens 100 MB pro Datei (Grenze von Cloudflare, darüber `413`, bevor der Worker läuft) |
+| `POST /delete` | Nur für Admins. Body `{"bucket": "audio", "names": ["…"]}`, höchstens 100 Namen. Löscht nur, was `unused_files(files)` mit der Upload-Zeit aus R2 als unbenutzt meldet. Gibt `{"deleted": ["…"]}` zurück |
+| `GET /list/<bucket>` | Nur für Admins. Gibt `{"files": [{"bucket", "name", "bytes", "uploaded_at"}]}` mit allen Dateien des Buckets zurück, im Format, das `unused_files(files)` erwartet |
 | `GET` / `HEAD /health` | Antwortet `200` mit `{"ok": true}`, ohne Login und ohne Zugriff auf R2. Die App prüft damit, ob der Worker erreichbar ist (jede Antwort unter `500` zählt als erreichbar, deshalb geht auch ein älterer Worker ohne `/health`, der `404` liefert) |
+
+Die drei Admin-Endpunkte antworten `401` ohne gültigen Login, `403` ohne Admin-Recht und `502`, wenn Supabase (Login-Schlüssel oder Datenbank) oder R2 nicht erreichbar ist.
 
 - **Login-Prüfung:** Das Token wird mit dem öffentlichen ECC-Schlüssel des Supabase-Projekts geprüft (`<SUPABASE_URL>/auth/v1/.well-known/jwks.json`, Paket `jose`), dazu Aussteller und Zielgruppe `authenticated`. Der Worker kennt kein Supabase-Geheimnis.
 - **Signatur:** HMAC-SHA256 über `<bucket>/<pfad>` und Ablaufzeit, mit dem Worker-Geheimnis `SIGNING_SECRET`.
-- **Rechte:** Jeder Angemeldete darf jede Datei lesen. Die Regel aus Supabase (nur freigegebene Songs, Admins alles) gilt im Worker noch nicht.
+- **Rechte:** Jeder Angemeldete darf jede Datei lesen. Die Regel aus Supabase (nur freigegebene Songs, Admins alles) gilt im Worker noch nicht. Hochladen, Löschen und die Liste prüft der Worker über `rpc/is_admin` mit dem Token des Nutzers. Signierte Adressen reichen dafür nicht.
 - **Logs:** Die Worker-Logs sind aus (`observability.enabled = false`), damit keine signierten Adressen gespeichert werden.
 
 ### Einrichten
@@ -399,7 +405,7 @@ npx wrangler secret put SIGNING_SECRET   # z. B. Ausgabe von: openssl rand -hex 
 npx wrangler deploy
 ```
 
-- `SUPABASE_URL` steht als normale Variable in `wrangler.toml`. Sie ist kein Geheimnis und steht auch in der App.
+- `SUPABASE_URL` und `SUPABASE_PUBLISHABLE_KEY` stehen als normale Variablen in `wrangler.toml`. Sie sind kein Geheimnis und stehen auch in der App.
 - `SIGNING_SECRET` liegt nur bei Cloudflare, nie im Repo. Für `npx wrangler dev` gehört es in `storage-worker/.dev.vars`, die von Git ignoriert wird.
 - Nach dem Deploy nennt Wrangler die Adresse `https://zamaric-storage.<subdomain>.workers.dev`.
 - `npm run typecheck` prüft die Typen.
