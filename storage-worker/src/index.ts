@@ -14,6 +14,7 @@ const listPageSize = 1000;
 const signaturePattern = /^[0-9a-f]{64}$/;
 const sha256Pattern = /^[0-9a-f]{64}$/;
 const sha256Header = "X-Content-SHA256";
+const storageHealthKey = "health-check";
 const uploadTypes: Record<string, { pattern: RegExp; contentType: string }> = {
   audio: {
     pattern: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.mp3$/,
@@ -534,6 +535,15 @@ export default {
           headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
         },
       );
+    }
+    if (url.pathname === "/health/storage") {
+      if (request.method !== "GET") return errorResponse(405, "Nur GET");
+      try {
+        await env.AUDIO.head(storageHealthKey);
+      } catch {
+        return storageError();
+      }
+      return jsonResponse({ ok: true });
     }
     if (url.pathname === "/sign") {
       if (request.method !== "POST") return errorResponse(405, "Nur POST");
