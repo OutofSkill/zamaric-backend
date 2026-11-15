@@ -4,12 +4,26 @@ interface Env {
   AUDIO: R2Bucket;
   SHEET_MUSIC: R2Bucket;
   SUPABASE_URL: string;
+  SUPABASE_PUBLISHABLE_KEY: string;
   SIGNING_SECRET: string;
 }
 
 const maximumValiditySeconds = 12 * 60 * 60;
 const maximumPathsPerRequest = 100;
+const listPageSize = 1000;
 const signaturePattern = /^[0-9a-f]{64}$/;
+const sha256Pattern = /^[0-9a-f]{64}$/;
+const sha256Header = "X-Content-SHA256";
+const uploadTypes: Record<string, { pattern: RegExp; contentType: string }> = {
+  audio: {
+    pattern: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.mp3$/,
+    contentType: "audio/mpeg",
+  },
+  sheet_music: {
+    pattern: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.pdf$/,
+    contentType: "application/pdf",
+  },
+};
 const keySetLifetimeMilliseconds = 10 * 60 * 1000;
 const userAgent = "zamaric-storage-worker/1.0";
 
@@ -151,12 +165,17 @@ async function signatureValid(
   );
 }
 
-async function loginRejection(request: Request, env: Env): Promise<string | null> {
+function bearerToken(request: Request): string | null {
   const header = request.headers.get("Authorization") ?? "";
   const match = /^Bearer\s+(.+)$/i.exec(header);
-  if (match === null) return "missing_token";
+  return match === null ? null : match[1];
+}
+
+async function loginRejection(request: Request, env: Env): Promise<string | null> {
+  const token = bearerToken(request);
+  if (token === null) return "missing_token";
   try {
-    await verifyToken(match[1], env);
+    await verifyToken(token, env);
     return null;
   } catch (error) {
     const code =
@@ -175,6 +194,63 @@ async function loginRejection(request: Request, env: Env): Promise<string | null
 
 function loginError(): Response {
   return errorResponse(401, "Nicht angemeldet");
+}
+
+class DatabaseUnavailable extends Error {}
+
+async function databaseCall(
+  env: Env,
+  token: string,
+  functionName: string,
+  parameters: Record<string, unknown>,
+): Promise<unknown> {
+  let response: Response;
+  try {
+    response = await fetch(`${supabaseBase(env)}/rest/v1/rpc/${functionName}`, {
+      method: "POST",
+      headers: {
+        apikey: env.SUPABASE_PUBLISHABLE_KEY,
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "User-Agent": userAgent,
+      },
+      body: JSON.stringify(parameters),
+    });
+  } catch {
+    throw new DatabaseUnavailable();
+  }
+  if (response.status !== 200) throw new DatabaseUnavailable();
+  return response.json();
+}
+
+function databaseError(): Response {
+  return errorResponse(502, "Datenbank nicht erreichbar");
+}
+
+function storageError(): Response {
+  return errorResponse(502, "Speicher nicht erreichbar");
+}
+
+async function adminToken(request: Request, env: Env): Promise<string | Response> {
+  const token = bearerToken(request);
+  if (token === null) return loginError();
+  try {
+    await verifyToken(token, env);
+  } catch (error) {
+    if (error instanceof KeySetUnavailable) {
+      return errorResponse(502, "Supabase nicht erreichbar");
+    }
+    return loginError();
+  }
+  try {
+    if ((await databaseCall(env, token, "is_admin", {})) !== true) {
+      return errorResponse(403, "Keine Berechtigung");
+    }
+  } catch {
+    return databaseError();
+  }
+  return token;
 }
 
 function pathAllowed(path: string): boolean {
@@ -316,6 +392,135 @@ async function signPaths(request: Request, env: Env): Promise<Response> {
   });
 }
 
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+  });
+}
+
+async function storeFile(
+  request: Request,
+  env: Env,
+  bucketName: string,
+  path: string,
+): Promise<Response> {
+  const bucket = bucketFor(env, bucketName);
+  if (bucket === undefined || !uploadTypes[bucketName].pattern.test(path)) {
+    return errorResponse(400, "Ungültiger Dateiname");
+  }
+  const token = await adminToken(request, env);
+  if (token instanceof Response) return token;
+  const length = Number(request.headers.get("Content-Length"));
+  if (!Number.isInteger(length) || length <= 0 || request.body === null) {
+    return errorResponse(411, "Dateigröße fehlt");
+  }
+  const sha256 = request.headers.get(sha256Header) ?? "";
+  if (!sha256Pattern.test(sha256)) {
+    return errorResponse(400, "Prüfsumme fehlt");
+  }
+  try {
+    if ((await bucket.head(path)) !== null) {
+      return errorResponse(409, "Datei existiert schon");
+    }
+    const object = await bucket.put(path, request.body, {
+      httpMetadata: { contentType: uploadTypes[bucketName].contentType },
+      sha256,
+    });
+    return jsonResponse({ name: object.key, bytes: object.size }, 201);
+  } catch {
+    return storageError();
+  }
+}
+
+async function deleteUnusedFiles(request: Request, env: Env): Promise<Response> {
+  const token = await adminToken(request, env);
+  if (token instanceof Response) return token;
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return errorResponse(400, "Ungültiges JSON");
+  }
+  const { bucket: bucketName, names } = (body ?? {}) as {
+    bucket?: unknown;
+    names?: unknown;
+  };
+  if (typeof bucketName !== "string") return errorResponse(400, "Unbekannter Bucket");
+  const bucket = bucketFor(env, bucketName);
+  if (bucket === undefined) return errorResponse(400, "Unbekannter Bucket");
+  if (
+    !Array.isArray(names) ||
+    names.length === 0 ||
+    names.length > maximumPathsPerRequest ||
+    !names.every((name) => typeof name === "string" && pathAllowed(name))
+  ) {
+    return errorResponse(400, "Ungültige Namen");
+  }
+  let heads: (R2Object | null)[];
+  try {
+    heads = await Promise.all(
+      [...new Set(names as string[])].map((name) => bucket.head(name)),
+    );
+  } catch {
+    return storageError();
+  }
+  const files = heads
+    .filter((head): head is R2Object => head !== null)
+    .map((head) => ({
+      bucket: bucketName,
+      name: head.key,
+      uploaded_at: head.uploaded.toISOString(),
+    }));
+  if (files.length === 0) return jsonResponse({ deleted: [] });
+  let rows: unknown;
+  try {
+    rows = await databaseCall(env, token, "unused_files", { files });
+  } catch {
+    return databaseError();
+  }
+  if (!Array.isArray(rows)) return databaseError();
+  const requested = new Set(files.map((file) => file.name));
+  const deletable = (rows as { bucket?: unknown; name?: unknown }[])
+    .filter((row) => row.bucket === bucketName && typeof row.name === "string")
+    .map((row) => row.name as string)
+    .filter((name) => requested.has(name));
+  if (deletable.length > 0) {
+    try {
+      await bucket.delete(deletable);
+    } catch {
+      return storageError();
+    }
+  }
+  return jsonResponse({ deleted: deletable });
+}
+
+async function listFiles(request: Request, env: Env, bucketName: string): Promise<Response> {
+  const bucket = bucketFor(env, bucketName);
+  if (bucket === undefined) return errorResponse(404, "Nicht gefunden");
+  const token = await adminToken(request, env);
+  if (token instanceof Response) return token;
+  const files: { bucket: string; name: string; bytes: number; uploaded_at: string }[] = [];
+  let cursor: string | undefined;
+  try {
+    do {
+      const page = await bucket.list({ limit: listPageSize, cursor });
+      for (const object of page.objects) {
+        files.push({
+          bucket: bucketName,
+          name: object.key,
+          bytes: object.size,
+          uploaded_at: object.uploaded.toISOString(),
+        });
+      }
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor !== undefined);
+  } catch {
+    return storageError();
+  }
+  return jsonResponse({ files });
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -334,8 +539,16 @@ export default {
       if (request.method !== "POST") return errorResponse(405, "Nur POST");
       return signPaths(request, env);
     }
-    if (request.method !== "GET" && request.method !== "HEAD") {
-      return errorResponse(405, "Nur GET und HEAD");
+    if (url.pathname === "/delete") {
+      if (request.method !== "POST") return errorResponse(405, "Nur POST");
+      return deleteUnusedFiles(request, env);
+    }
+    if (url.pathname.startsWith("/list/")) {
+      if (request.method !== "GET") return errorResponse(405, "Nur GET");
+      return listFiles(request, env, url.pathname.slice("/list/".length));
+    }
+    if (request.method !== "GET" && request.method !== "HEAD" && request.method !== "PUT") {
+      return errorResponse(405, "Nur GET, HEAD und PUT");
     }
     const separator = url.pathname.indexOf("/", 1);
     if (separator < 0) return errorResponse(404, "Nicht gefunden");
@@ -346,6 +559,7 @@ export default {
     } catch {
       return errorResponse(400, "Ungültiger Pfad");
     }
+    if (request.method === "PUT") return storeFile(request, env, bucketName, path);
     return serveFile(request, env, bucketName, path);
   },
 } satisfies ExportedHandler<Env>;
