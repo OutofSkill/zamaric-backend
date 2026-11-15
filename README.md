@@ -387,6 +387,7 @@ Der Bucket-Name in der Adresse ist der von Supabase (`audio`, `sheet_music`), da
 | `POST /delete` | Nur für Admins. Body `{"bucket": "audio", "names": ["…"]}`, höchstens 100 Namen. Löscht nur, was `unused_files(files)` mit der Upload-Zeit aus R2 als unbenutzt meldet. Gibt `{"deleted": ["…"]}` zurück |
 | `GET /list/<bucket>` | Nur für Admins. Gibt `{"files": [{"bucket", "name", "bytes", "uploaded_at"}]}` mit allen Dateien des Buckets zurück, im Format, das `unused_files(files)` erwartet |
 | `GET` / `HEAD /health` | Antwortet `200` mit `{"ok": true}`, ohne Login und ohne Zugriff auf R2. Die App prüft damit, ob der Worker erreichbar ist (jede Antwort unter `500` zählt als erreichbar, deshalb geht auch ein älterer Worker ohne `/health`, der `404` liefert) |
+| `GET /health/storage` | Fragt R2 nach einer festen Datei, die es nicht gibt (`head` auf `health-check` in `audio`), und antwortet `200` mit `{"ok": true}`, sobald R2 geantwortet hat, sonst `502`. Ohne Login, gibt nichts über die Dateien preis. Die Entwicklerseite misst damit jede Minute, wie schnell der Speicher antwortet |
 
 Die drei Admin-Endpunkte antworten `401` ohne gültigen Login, `403` ohne Admin-Recht und `502`, wenn Supabase (Login-Schlüssel oder Datenbank) oder R2 nicht erreichbar ist.
 
