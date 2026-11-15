@@ -14,7 +14,8 @@ Verwandte Repos:
 1. [TODO](#todo)
 2. [Aufbau](#aufbau)
 3. [Supabase](#supabase)
-4. [Altes Backend (Legacy)](#altes-backend-legacy)
+4. [Storage-Worker (Cloudflare R2)](#storage-worker-cloudflare-r2)
+5. [Altes Backend (Legacy)](#altes-backend-legacy)
 
 ---
 
@@ -37,10 +38,12 @@ Verwandte Repos:
 | Teil | Ordner | Stand |
 |---|---|---|
 | Supabase | `supabase/` | Neues Backend: Datenbank, Dateien, Accounts |
+| Storage-Worker | `storage-worker/` | Cloudflare Worker vor den R2-Buckets. Liefert der App die Dateien aus |
 | Altes Backend | `legacy/` | FastAPI, Watcher und SQLite auf dem Pi. Abgeschaltet, die App nutzt es nicht mehr |
 
 ```
 supabase/migrations/      Schema von Supabase als SQL
+storage-worker/           Cloudflare Worker für die Dateien in R2
 legacy/                   altes Backend
 venv/                     Python-Umgebung (nicht im Repo)
 ```
@@ -51,7 +54,7 @@ venv/                     Python-Umgebung (nicht im Repo)
 
 ### Projekt
 
-- Free-Plan, Region Frankfurt.
+- Free-Plan, Region `eu-west-3` (Paris).
 - **Buckets**, beide privat:
   - `audio` (`audio/mpeg`): Playbacks und Einzähler
   - `sheet_music` (`application/pdf`): Noten
@@ -352,6 +355,54 @@ Aus `20261106120000_dev_site` (`integrity_report()` in der Fassung aus `20261106
 | `largest_files(max_rows = 20)` | größte Dateien mit Tabelle und Song der Zeile, die auf sie zeigt (null = unbenutzt). Höchstens 200 |
 | `pending_releases()` | wartende neue Songs und Songs mit wartenden Änderungen, mit Zahl der Einzähler, Playbacks und Noten (bei neuen Songs alle, sonst nur die wartenden) |
 | `cron_runs(max_rows = 50)` | letzte Läufe aller Cron-Jobs aus `cron.job_run_details`. Höchstens 500 |
+
+---
+
+## Storage-Worker (Cloudflare R2)
+
+Die Dateien ziehen von Supabase Storage (Free-Plan: 1 GB) nach Cloudflare R2 (Gratis-Rahmen: 10 GB, Datenverkehr frei). Davor steht ein Cloudflare Worker in `storage-worker/`, weil R2 die Supabase-Anmeldung nicht kennt.
+
+### Buckets
+
+Beide liegen in der EU-Jurisdiktion, sind privat (kein `r2.dev`, keine eigene Domain) und haben kein Object Lock. Die Pfade sind dieselben wie in den Datenbank-Zeilen.
+
+| Supabase | R2 | Binding im Worker |
+|---|---|---|
+| `audio` | `audio` | `AUDIO` |
+| `sheet_music` | `sheet-music` (R2 erlaubt keine Unterstriche) | `SHEET_MUSIC` |
+
+Kopiert wurde am 12.11.2026 mit `rclone copy`, geprüft mit `rclone check`: 306 Dateien in `audio`, 1306 in `sheet-music`, ohne Unterschiede.
+
+### Endpunkte
+
+Der Bucket-Name in der Adresse ist der von Supabase (`audio`, `sheet_music`), damit die App ihre Pfade unverändert nutzen kann.
+
+| Anfrage | Was passiert |
+|---|---|
+| `GET` / `HEAD /<bucket>/<pfad>` | Liefert die Datei, mit `Range` (Teilabrufe fürs Streamen, Antwort `206`) und `If-None-Match` (`304`). Erlaubt mit gültigem Supabase-Login im Header `Authorization: Bearer <token>` oder mit gültiger Signatur (`?expires=…&signature=…`) |
+| `POST /sign` | Body `{"bucket": "audio", "paths": ["…"], "expiresIn": 43200}`. Nur mit gültigem Login. Gibt `{"urls": [{"path", "url", "expiresAt"}]}` zurück. Höchstens 100 Pfade, höchstens 12 Stunden gültig |
+| `GET` / `HEAD /health` | Antwortet `200` mit `{"ok": true}`, ohne Login und ohne Zugriff auf R2. Die App prüft damit, ob der Worker erreichbar ist (jede Antwort unter `500` zählt als erreichbar, deshalb geht auch ein älterer Worker ohne `/health`, der `404` liefert) |
+
+- **Login-Prüfung:** Das Token wird mit dem öffentlichen ECC-Schlüssel des Supabase-Projekts geprüft (`<SUPABASE_URL>/auth/v1/.well-known/jwks.json`, Paket `jose`), dazu Aussteller und Zielgruppe `authenticated`. Der Worker kennt kein Supabase-Geheimnis.
+- **Signatur:** HMAC-SHA256 über `<bucket>/<pfad>` und Ablaufzeit, mit dem Worker-Geheimnis `SIGNING_SECRET`.
+- **Rechte:** Jeder Angemeldete darf jede Datei lesen. Die Regel aus Supabase (nur freigegebene Songs, Admins alles) gilt im Worker noch nicht.
+- **Logs:** Die Worker-Logs sind aus (`observability.enabled = false`), damit keine signierten Adressen gespeichert werden.
+
+### Einrichten
+
+Im Ordner `storage-worker/`:
+
+```bash
+npm install
+npx wrangler login
+npx wrangler secret put SIGNING_SECRET   # z. B. Ausgabe von: openssl rand -hex 32
+npx wrangler deploy
+```
+
+- `SUPABASE_URL` steht als normale Variable in `wrangler.toml`. Sie ist kein Geheimnis und steht auch in der App.
+- `SIGNING_SECRET` liegt nur bei Cloudflare, nie im Repo. Für `npx wrangler dev` gehört es in `storage-worker/.dev.vars`, die von Git ignoriert wird.
+- Nach dem Deploy nennt Wrangler die Adresse `https://zamaric-storage.<subdomain>.workers.dev`.
+- `npm run typecheck` prüft die Typen.
 
 ---
 
