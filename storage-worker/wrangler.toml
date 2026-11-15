@@ -1,0 +1,21 @@
+name = "zamaric-storage"
+main = "src/index.ts"
+compatibility_date = "2025-06-01"
+workers_dev = true
+preview_urls = false
+
+[observability]
+enabled = false
+
+[vars]
+SUPABASE_URL = "https://undpiaghhmrzlqdyybep.supabase.co"
+
+[[r2_buckets]]
+binding = "AUDIO"
+bucket_name = "audio"
+jurisdiction = "eu"
+
+[[r2_buckets]]
+binding = "SHEET_MUSIC"
+bucket_name = "sheet-music"
+jurisdiction = "eu"
