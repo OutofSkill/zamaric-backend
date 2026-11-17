@@ -55,7 +55,7 @@ venv/                     Python-Umgebung (nicht im Repo)
 ### Projekt
 
 - Free-Plan, Region `eu-west-3` (Paris).
-- **Buckets** `audio` und `sheet_music` in Supabase Storage: nicht mehr in Gebrauch. Seit `20261115180000_r2_dev_checks` gibt es keine Policies mehr auf `storage.objects`, über die API kommt niemand an die alten Dateien. Die Dateien liegen in Cloudflare R2 (siehe [Storage-Worker](#storage-worker-cloudflare-r2)):
+- **Buckets** `audio` und `sheet_music` in Supabase Storage: gelöscht. Seit `20261115180000_r2_dev_checks` gibt es keine Policies mehr auf `storage.objects`. Die Dateien liegen in Cloudflare R2 (siehe [Storage-Worker](#storage-worker-cloudflare-r2)):
   - `audio` (`audio/mpeg`): Playbacks und Einzähler
   - `sheet_music` (`application/pdf`): Noten
   - Dateien heißen `<uuid>.mp3` bzw. `<uuid>.pdf`.
@@ -88,6 +88,7 @@ Das Schema steht als SQL in `supabase/migrations/`. Jede Migration wird einmal i
 | `20261106180000_integrity_tuning` | `integrity_report()`: „Song ohne Noten“ entfällt, doppelte Noten nur noch bei mehreren doppelten Dateien in einem Song oder derselben Datei in verschiedenen Songs |
 | `20261115120000_r2_storage` | Dateien in Cloudflare R2: `is_admin()` für den Storage-Worker, `unused_files(files)` prüft eine Dateiliste aus R2 statt `storage.objects` |
 | `20261115180000_r2_dev_checks` | Prüfungen der Entwicklerseite mit Dateiliste aus R2 (`integrity_report(files)` mit neuen Prüfungen `file_unknown` und `file_empty`, `missing_files(files)`, `storage_usage(files)`, `largest_files(files, max_rows)`), alte Fassungen ohne Liste und `unused_files()` entfernt, alle Policies auf `storage.objects` entfernt |
+| `20261117120000_release_hold_guard` | Freigabesperre abgesichert: Admins dürfen über die API keine Zeilen mit `replaces_id` oder `release_at` anlegen und Buchstaben nur mit einem Einzähler desselben Songs (`count_in_matches_playback`). `apply_song_changes` sperrt den Song, übernimmt nur fällige Zeilen und ersetzt nur sichtbare Zeilen desselben Songs, sonst `replaces_other_song` |
 
 ### Datenmodell
 
@@ -284,7 +285,7 @@ RLS ist auf jeder Tabelle an. Ohne Anmeldung (`anon`) sieht man nichts.
 | Was | Angemeldete | Admins |
 |---|---|---|
 | `category`, `level`, `instrument`, `part`, `part_instrument` | lesen | lesen |
-| `song` und alles, was dazugehört | nur freigegebene lesen, ohne wartende Änderungen | alles lesen, nur zu wartenden Songs hinzufügen, Änderungen nur über `update_song()` |
+| `song` und alles, was dazugehört | nur freigegebene lesen, ohne wartende Änderungen | alles lesen, nur zu wartenden Songs hinzufügen (ohne `replaces_id`/`release_at`, Buchstaben nur mit Einzähler desselben Songs), Änderungen nur über `update_song()` |
 | `profiles` | eigenes lesen und ändern | wie Angemeldete |
 | `user_instrument` | eigene lesen, hinzufügen, entfernen | wie Angemeldete |
 | `admin` | nichts | nichts |
@@ -294,7 +295,7 @@ RLS ist auf jeder Tabelle an. Ohne Anmeldung (`anon`) sieht man nichts.
 - Ändern oder Löschen von Inhalten darf niemand direkt über die API. Admins ändern Songs nur über `update_song()`, die selbst prüft, was erlaubt ist. Alles andere macht Phil im Dashboard oder SQL-Editor, Dateien in R2 nur über den Storage-Worker.
 - **Unbenutzte Dateien** (`private.file_is_unused()`): keine Zeile zeigt auf sie (auch keine wartende), der Name hat die Form `<uuid>.mp3` / `<uuid>.pdf`, und sie ist älter als eine Stunde. Nur solche Dateien dürfen Admins löschen. So erwischt das Aufräumen nie eine Datei, die gerade erst hochgeladen wird.
 - Kategorien, Level, Instrumente und Stimmen pflegt nur Phil.
-- Hilfsfunktionen liegen im Schema `private` und sind nicht über die API aufrufbar: `is_admin()`, `is_clean_name()`, `song_is_pending()`, `song_is_approved()`, `playback_is_pending()`, `playback_is_approved()`, `file_is_approved()`, `file_is_unused()`, `release_time()`, `send_ntfy()`, `apply_song_changes()`, `apply_due_song_changes()`, `file_rows()` (alle Datei-Zeilen mit Bucket, für die Prüfungen der Entwicklerseite).
+- Hilfsfunktionen liegen im Schema `private` und sind nicht über die API aufrufbar: `is_admin()`, `is_clean_name()`, `song_is_pending()`, `song_is_approved()`, `playback_is_pending()`, `playback_is_approved()`, `count_in_matches_playback()`, `file_is_approved()`, `file_is_unused()`, `release_time()`, `send_ntfy()`, `apply_song_changes()`, `apply_due_song_changes()`, `file_rows()` (alle Datei-Zeilen mit Bucket, für die Prüfungen der Entwicklerseite).
 
 ### Freigabe und Benachrichtigung
 
@@ -308,8 +309,12 @@ RLS ist auf jeder Tabelle an. Ohne Anmeldung (`anon`) sieht man nichts.
 ```sql
 -- neuer Song
 update song set release_at = now() where id = …;
--- wartende Änderung an einem Song
-select private.apply_song_changes(…);  -- Song-ID
+-- wartende Änderung an einem Song (Song-ID fünfmal einsetzen, alles in einem Lauf)
+select 1 from song where id = … for update;
+update count_in set release_at = now() where song_id = … and release_at is not null;
+update playback set release_at = now() where song_id = … and release_at is not null;
+update sheet_music set release_at = now() where song_id = … and release_at is not null;
+select private.apply_song_changes(…);
 ```
 
 ### `import_song`
