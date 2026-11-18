@@ -89,6 +89,7 @@ Das Schema steht als SQL in `supabase/migrations/`. Jede Migration wird einmal i
 | `20261115120000_r2_storage` | Dateien in Cloudflare R2: `is_admin()` für den Storage-Worker, `unused_files(files)` prüft eine Dateiliste aus R2 statt `storage.objects` |
 | `20261115180000_r2_dev_checks` | Prüfungen der Entwicklerseite mit Dateiliste aus R2 (`integrity_report(files)` mit neuen Prüfungen `file_unknown` und `file_empty`, `missing_files(files)`, `storage_usage(files)`, `largest_files(files, max_rows)`), alte Fassungen ohne Liste und `unused_files()` entfernt, alle Policies auf `storage.objects` entfernt |
 | `20261117120000_release_hold_guard` | Freigabesperre abgesichert: Admins dürfen über die API keine Zeilen mit `replaces_id` oder `release_at` anlegen und Buchstaben nur mit einem Einzähler desselben Songs (`count_in_matches_playback`). `apply_song_changes` sperrt den Song, übernimmt nur fällige Zeilen und ersetzt nur sichtbare Zeilen desselben Songs, sonst `replaces_other_song` |
+| `20261118120000_release_hold_content` | Keine direkten Admin-Inserts mehr: alle INSERT-Policies auf Songs und Inhalte entfernt, `import_song` läuft als Besitzer und prüft selbst auf Admin, `count_in_matches_playback` entfernt. `update_song` schiebt bei einem wartenden Song die Freigabe auf frühestens 24 Stunden nach der Änderung. `file_is_referenced(bucket_name, file_name)` für den Storage-Worker |
 
 ### Datenmodell
 
@@ -285,7 +286,7 @@ RLS ist auf jeder Tabelle an. Ohne Anmeldung (`anon`) sieht man nichts.
 | Was | Angemeldete | Admins |
 |---|---|---|
 | `category`, `level`, `instrument`, `part`, `part_instrument` | lesen | lesen |
-| `song` und alles, was dazugehört | nur freigegebene lesen, ohne wartende Änderungen | alles lesen, nur zu wartenden Songs hinzufügen (ohne `replaces_id`/`release_at`, Buchstaben nur mit Einzähler desselben Songs), Änderungen nur über `update_song()` |
+| `song` und alles, was dazugehört | nur freigegebene lesen, ohne wartende Änderungen | alles lesen, neue Songs nur über `import_song()`, Änderungen nur über `update_song()` |
 | `profiles` | eigenes lesen und ändern | wie Angemeldete |
 | `user_instrument` | eigene lesen, hinzufügen, entfernen | wie Angemeldete |
 | `admin` | nichts | nichts |
@@ -295,14 +296,14 @@ RLS ist auf jeder Tabelle an. Ohne Anmeldung (`anon`) sieht man nichts.
 - Ändern oder Löschen von Inhalten darf niemand direkt über die API. Admins ändern Songs nur über `update_song()`, die selbst prüft, was erlaubt ist. Alles andere macht Phil im Dashboard oder SQL-Editor, Dateien in R2 nur über den Storage-Worker.
 - **Unbenutzte Dateien** (`private.file_is_unused()`): keine Zeile zeigt auf sie (auch keine wartende), der Name hat die Form `<uuid>.mp3` / `<uuid>.pdf`, und sie ist älter als eine Stunde. Nur solche Dateien dürfen Admins löschen. So erwischt das Aufräumen nie eine Datei, die gerade erst hochgeladen wird.
 - Kategorien, Level, Instrumente und Stimmen pflegt nur Phil.
-- Hilfsfunktionen liegen im Schema `private` und sind nicht über die API aufrufbar: `is_admin()`, `is_clean_name()`, `song_is_pending()`, `song_is_approved()`, `playback_is_pending()`, `playback_is_approved()`, `count_in_matches_playback()`, `file_is_approved()`, `file_is_unused()`, `release_time()`, `send_ntfy()`, `apply_song_changes()`, `apply_due_song_changes()`, `file_rows()` (alle Datei-Zeilen mit Bucket, für die Prüfungen der Entwicklerseite).
+- Hilfsfunktionen liegen im Schema `private` und sind nicht über die API aufrufbar: `is_admin()`, `is_clean_name()`, `song_is_pending()`, `song_is_approved()`, `playback_is_pending()`, `playback_is_approved()`, `file_is_approved()`, `file_is_unused()`, `release_time()`, `send_ntfy()`, `apply_song_changes()`, `apply_due_song_changes()`, `file_rows()` (alle Datei-Zeilen mit Bucket, für die Prüfungen der Entwicklerseite).
 
 ### Freigabe und Benachrichtigung
 
 1. Beim Anlegen setzt der Trigger `song_prepare_new` `created_at` auf jetzt und rechnet `release_at` mit `private.release_time()` aus: der erste Zeitpunkt um 4 Uhr (Europe/Berlin), der mindestens 24 Stunden nach dem Upload und nicht vor dem Wunschtag liegt.
 2. Ab `release_at` ist der Song in der App sichtbar. Dafür läuft kein Job, die Leserechte vergleichen nur mit der aktuellen Zeit.
 3. Der Trigger `song_notify_new` schickt über `pg_net` eine Nachricht an ntfy.sh: Song, Kategorie, Upload-Zeitpunkt und Freigabe. `pg_net` sendet erst nach dem Commit, scheitert das Anlegen, geht also nichts raus. `private.send_ntfy()` schreibt jede Nachricht zusätzlich mit der `request_id` von `pg_net` in `notification` (scheitert das Anlegen, verschwindet auch diese Zeile). Das Topic steht nur im Vault, ntfy.sh selbst hebt Nachrichten nur 12 Stunden auf.
-4. Änderungen an einem freigegebenen Song warten genauso (gleiche Regel, eigenes `release_at` an den Zeilen) und übernimmt der Cron-Job `apply_song_changes`. Wartet der Song selbst noch, gelten Änderungen sofort. Verlag und Link gelten immer sofort.
+4. Änderungen an einem freigegebenen Song warten genauso (gleiche Regel, eigenes `release_at` an den Zeilen) und übernimmt der Cron-Job `apply_song_changes`. Wartet der Song selbst noch, gelten Änderungen sofort, seine Freigabe rückt aber auf frühestens 24 Stunden nach der Änderung (wieder um 4 Uhr). Verlag und Link gelten immer sofort.
 
 **Früher freigeben** (im SQL-Editor):
 
@@ -321,14 +322,14 @@ select private.apply_song_changes(…);
 
 `public.import_song(payload jsonb) returns bigint` legt einen ganzen Song in einer Transaktion an. Das Upload-Tool ruft sie auf, das Manifest steht in der README von `zamaric-toolchain` unter „POST /api/upload“.
 
-- `security invoker`: Es gelten die RLS-Regeln des Aufrufers. Ausführen darf sie nur `authenticated`.
+- `security definer`: läuft als Besitzer, weil Admins über RLS nichts mehr direkt einfügen dürfen. Prüft deshalb selbst, dass ein Admin aufruft (sonst `forbidden`). Ausführen darf sie nur `authenticated`.
 - `payload` ist das Manifest, `path` jeweils der Dateiname im Bucket. Der Bucket ergibt sich aus der Tabelle: `playback` und `count_in` → `audio`, `sheet_music` → `sheet_music`.
 - Legt Song, Einzähler, Playbacks, Buchstaben, Playback-Instrumente und Noten an und gibt die ID des Songs zurück. Bei einem Fehler wird nichts eingetragen.
 - Löst `letters[].count_in` über den Namen innerhalb desselben Songs auf. Ein Buchstabe kann also nie auf den Einzähler eines anderen Songs zeigen.
 - Fehler als Meldung, die genaue Ursache steht im Detail (nur fürs Log, nie für den Browser):
   - `song_exists`: Den Song gibt es in der Kategorie schon.
   - `invalid_manifest`: falsche Form, weder Playbacks noch Noten, Buchstaben nicht streng aufsteigend oder hinter der Länge, Einzähler fehlt, `instrument_ids` passen nicht zu `instrument_mode` oder sind doppelt, oder eine Regel der Tabellen ist verletzt.
-  - `forbidden`: RLS lässt das Einfügen nicht zu.
+  - `forbidden`: Der Aufrufer ist kein Admin.
 - Speichert die Prüfsumme jeder Datei (`sha256`), die Container 2 selbst rechnet.
 
 > **Nicht im SQL-Editor ausprobieren.** Dort läuft sie als `postgres`: Sie legt einen echten Song an und löst die ntfy-Nachricht aus.
@@ -337,17 +338,19 @@ select private.apply_song_changes(…);
 
 `public.update_song(payload jsonb) returns timestamptz` legt eine Änderung an einem bestehenden Song an und gibt zurück, ab wann sie sichtbar ist. Das Manifest steht in der README von `zamaric-toolchain` unter „POST /api/update“.
 
-- `security definer`: läuft als Besitzer, weil Admins über RLS keine Zeilen zu freigegebenen Songs hinzufügen dürfen. Prüft deshalb selbst, dass ein Admin aufruft (sonst `forbidden`).
+- `security definer`: läuft als Besitzer, weil Admins über RLS keine Zeilen hinzufügen dürfen. Prüft deshalb selbst, dass ein Admin aufruft (sonst `forbidden`).
 - Setzt Verlag und Link sofort, löscht eine schon wartende Änderung und legt die neuen und geänderten Einträge als wartende Zeilen an. Zugeordnet wird wie bei den Einmaligkeits-Regeln: Noten über Stimme + Level, Playbacks über den Zusatz, Einzähler über den Namen. Gibt es eine sichtbare Zeile dazu, zeigt `replaces_id` auf sie.
 - Ein Playback ohne `path` behält seine MP3 (nur Buchstaben, Sichtbarkeit oder Schreibweise ändern sich). Länge und Prüfsumme kommen dann aus der alten Zeile.
 - Buchstaben verweisen erst auf einen Einzähler aus dieser Änderung, sonst auf einen sichtbaren.
-- Wartet der Song noch auf seine erste Freigabe, übernimmt sie die Änderung sofort und gibt die Freigabe des Songs zurück.
+- Wartet der Song noch auf seine erste Freigabe, übernimmt sie die Änderung sofort, schiebt die Freigabe des Songs auf den ersten 4-Uhr-Termin mindestens 24 Stunden später (ein späterer Termin bleibt) und gibt die neue Freigabe zurück. So kann nichts kurz vor der Veröffentlichung unbemerkt dazukommen.
 - Schickt eine ntfy-Nachricht pro Aufruf mit der Zahl der neuen oder geänderten Noten, Playbacks und Einzähler, außer es haben sich nur Verlag oder Link geändert.
 - Fehler: `forbidden`, `invalid_manifest` (falsche Form, Song fehlt, Playback ohne `path` ohne Vorlage, Buchstaben nicht streng aufsteigend oder hinter der Länge, Einzähler fehlt, `instrument_ids` passen nicht zu `instrument_mode` oder sind doppelt, Regel der Tabellen verletzt).
 
 **`set_file_sha256(kind, row_id, hash)`**: trägt die Prüfsumme einer alten Datei nach (`kind` = `count_in`, `playback` oder `sheet_music`). Nur für Admins, überschreibt nie eine vorhandene.
 
 **`unused_files(files)`**: Aus einer Dateiliste von R2 (`[{"bucket", "name", "uploaded_at"}]`, wie sie `GET /list/<bucket>` des Storage-Workers liefert) die Dateien (`bucket`, `name`), die als unbenutzt gelöscht werden dürfen (siehe [Rechte](#rechte-rls)). Für Nicht-Admins leer.
+
+**`file_is_referenced(bucket_name, file_name)`**: `true`, wenn irgendeine Zeile (sichtbar oder wartend) auf die Datei zeigt (`audio`: `playback` und `count_in`, `sheet_music`: `sheet_music`). Der Storage-Worker fragt das vor und nach dem Speichern jeder Datei, damit niemand eine Datei erst nach der Freigabe hochladen kann. Nur für Admins (sonst `forbidden`).
 
 ### Funktionen der Entwicklerseite
 
@@ -387,8 +390,8 @@ Der Bucket-Name in der Adresse ist der von Supabase (`audio`, `sheet_music`), da
 | Anfrage | Was passiert |
 |---|---|
 | `GET` / `HEAD /<bucket>/<pfad>` | Liefert die Datei, mit `Range` (Teilabrufe fürs Streamen, Antwort `206`) und `If-None-Match` (`304`). Erlaubt mit gültigem Supabase-Login im Header `Authorization: Bearer <token>` oder mit gültiger Signatur (`?expires=…&signature=…`) |
-| `POST /sign` | Body `{"bucket": "audio", "paths": ["…"], "expiresIn": 43200}`. Nur mit gültigem Login. Gibt `{"urls": [{"path", "url", "expiresAt"}]}` zurück. Höchstens 100 Pfade, höchstens 12 Stunden gültig |
-| `PUT /<bucket>/<name>` | Nur für Admins. Lädt eine Datei hoch, Name `<uuid>.mp3` in `audio` bzw. `<uuid>.pdf` in `sheet_music`, sonst `400` (noch vor der Login-Prüfung). Den Content-Type setzt der Worker. Antwortet `201` mit `{"name", "bytes"}`, `409`, wenn die Datei schon existiert (nie überschreiben), `411` ohne `Content-Length` oder bei leerer Datei. Pflicht ist der Header `X-Content-SHA256` mit der SHA-256 der Datei (64 Hex-Zeichen, sonst `400`). R2 prüft sie beim Speichern und lehnt eine abweichende Datei ab (`502`). Höchstens 100 MB pro Datei (Grenze von Cloudflare, darüber `413`, bevor der Worker läuft) |
+| `POST /sign` | Body `{"bucket": "audio", "paths": ["…"], "expiresIn": 43200}`. Nur mit gültigem Login. Gibt `{"urls": [{"path", "url", "expiresAt"}]}` zurück. Höchstens 100 Pfade mit je höchstens 512 Zeichen, höchstens 12 Stunden gültig. Ein Body über 64 KB wird nicht vollständig gelesen (`413`) |
+| `PUT /<bucket>/<name>` | Nur für Admins. Lädt eine Datei hoch, Name `<uuid>.mp3` in `audio` bzw. `<uuid>.pdf` in `sheet_music`, sonst `400` (noch vor der Login-Prüfung). Den Content-Type setzt der Worker. Antwortet `201` mit `{"name", "bytes"}`, `409`, wenn die Datei schon existiert (nie überschreiben, auch nicht bei gleichzeitigen Uploads, weil R2 nur schreibt, wenn der Name noch frei ist) oder schon eine Zeile auf den Namen zeigt (`file_is_referenced`, so lassen sich Dateien nicht nach der Freigabe nachreichen). Die Prüfung läuft vor und nach dem Speichern: zeigt danach eine Zeile auf den Namen, löscht der Worker die Datei wieder (`409`). `502`, wenn die Datenbank nicht antwortet (nach dem Speichern wird die Datei dann ebenfalls gelöscht), `411` ohne `Content-Length` oder bei leerer Datei. Pflicht ist der Header `X-Content-SHA256` mit der SHA-256 der Datei (64 Hex-Zeichen, sonst `400`). R2 prüft sie beim Speichern und lehnt eine abweichende Datei ab (`502`). Höchstens 100 MB pro Datei (Grenze von Cloudflare, darüber `413`, bevor der Worker läuft) |
 | `POST /delete` | Nur für Admins. Body `{"bucket": "audio", "names": ["…"]}`, höchstens 100 Namen. Löscht nur, was `unused_files(files)` mit der Upload-Zeit aus R2 als unbenutzt meldet. Gibt `{"deleted": ["…"]}` zurück |
 | `GET /list/<bucket>` | Nur für Admins. Gibt `{"files": [{"bucket", "name", "bytes", "uploaded_at"}]}` mit allen Dateien des Buckets zurück, im Format, das `unused_files(files)` erwartet |
 | `GET` / `HEAD /health` | Antwortet `200` mit `{"ok": true}`, ohne Login und ohne Zugriff auf R2. Die App prüft damit, ob der Worker erreichbar ist (jede Antwort unter `500` zählt als erreichbar, deshalb geht auch ein älterer Worker ohne `/health`, der `404` liefert) |
@@ -398,7 +401,7 @@ Die drei Admin-Endpunkte antworten `401` ohne gültigen Login, `403` ohne Admin-
 
 - **Login-Prüfung:** Das Token wird mit dem öffentlichen ECC-Schlüssel des Supabase-Projekts geprüft (`<SUPABASE_URL>/auth/v1/.well-known/jwks.json`, Paket `jose`), dazu Aussteller und Zielgruppe `authenticated`. Der Worker kennt kein Supabase-Geheimnis.
 - **Signatur:** HMAC-SHA256 über `<bucket>/<pfad>` und Ablaufzeit, mit dem Worker-Geheimnis `SIGNING_SECRET`.
-- **Rechte:** Jeder Angemeldete darf jede Datei lesen. Die Regel aus Supabase (nur freigegebene Songs, Admins alles) gilt im Worker noch nicht. Hochladen, Löschen und die Liste prüft der Worker über `rpc/is_admin` mit dem Token des Nutzers. Signierte Adressen reichen dafür nicht.
+- **Rechte:** Jeder Angemeldete darf jede Datei lesen. Die Regel aus Supabase (nur freigegebene Songs, Admins alles) gilt im Worker noch nicht. Hochladen, Löschen und die Liste prüft der Worker über `rpc/is_admin` mit dem Token des Nutzers, beim Hochladen zusätzlich über `rpc/file_is_referenced`, dass noch keine Zeile auf den Namen zeigt. Signierte Adressen reichen dafür nicht.
 - **Logs:** Die Worker-Logs sind aus (`observability.enabled = false`), damit keine signierten Adressen gespeichert werden.
 
 ### Einrichten
