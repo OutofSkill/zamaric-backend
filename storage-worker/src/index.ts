@@ -10,6 +10,8 @@ interface Env {
 
 const maximumValiditySeconds = 12 * 60 * 60;
 const maximumPathsPerRequest = 100;
+const maximumSignBodyBytes = 64 * 1024;
+const maximumPathLength = 512;
 const listPageSize = 1000;
 const signaturePattern = /^[0-9a-f]{64}$/;
 const sha256Pattern = /^[0-9a-f]{64}$/;
@@ -348,12 +350,44 @@ async function serveFile(
   return new Response(object.body, { headers });
 }
 
+async function limitedBody(request: Request, limit: number): Promise<string | null> {
+  if (Number(request.headers.get("Content-Length") ?? 0) > limit) return null;
+  if (request.body === null) return "";
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > limit) {
+      await reader.cancel();
+      return null;
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
+}
+
 async function signPaths(request: Request, env: Env): Promise<Response> {
   const rejection = await loginRejection(request, env);
   if (rejection !== null) return loginError();
+  let text: string | null;
+  try {
+    text = await limitedBody(request, maximumSignBodyBytes);
+  } catch {
+    return errorResponse(400, "Anfrage abgebrochen");
+  }
+  if (text === null) return errorResponse(413, "Anfrage zu groß");
   let body: unknown;
   try {
-    body = await request.json();
+    body = JSON.parse(text);
   } catch {
     return errorResponse(400, "Ungültiges JSON");
   }
@@ -369,7 +403,10 @@ async function signPaths(request: Request, env: Env): Promise<Response> {
     !Array.isArray(paths) ||
     paths.length === 0 ||
     paths.length > maximumPathsPerRequest ||
-    !paths.every((path) => typeof path === "string" && pathAllowed(path))
+    !paths.every(
+      (path) =>
+        typeof path === "string" && path.length <= maximumPathLength && pathAllowed(path),
+    )
   ) {
     return errorResponse(400, "Ungültige Pfade");
   }
@@ -420,18 +457,53 @@ async function storeFile(
   if (!sha256Pattern.test(sha256)) {
     return errorResponse(400, "Prüfsumme fehlt");
   }
+  const referencedBefore = await fileReferenced(env, token, bucketName, path);
+  if (referencedBefore instanceof Response) return referencedBefore;
+  if (referencedBefore) return errorResponse(409, "Datei gehört schon zu einem Song");
+  let object: R2Object | null;
   try {
     if ((await bucket.head(path)) !== null) {
       return errorResponse(409, "Datei existiert schon");
     }
-    const object = await bucket.put(path, request.body, {
+    object = await bucket.put(path, request.body, {
+      onlyIf: { etagDoesNotMatch: "*" },
       httpMetadata: { contentType: uploadTypes[bucketName].contentType },
       sha256,
     });
-    return jsonResponse({ name: object.key, bytes: object.size }, 201);
   } catch {
     return storageError();
   }
+  if (object === null) return errorResponse(409, "Datei existiert schon");
+  const referencedAfter = await fileReferenced(env, token, bucketName, path);
+  if (referencedAfter !== false) {
+    try {
+      await bucket.delete(path);
+    } catch {
+      return storageError();
+    }
+    if (referencedAfter instanceof Response) return referencedAfter;
+    return errorResponse(409, "Datei gehört schon zu einem Song");
+  }
+  return jsonResponse({ name: object.key, bytes: object.size }, 201);
+}
+
+async function fileReferenced(
+  env: Env,
+  token: string,
+  bucketName: string,
+  path: string,
+): Promise<boolean | Response> {
+  let referenced: unknown;
+  try {
+    referenced = await databaseCall(env, token, "file_is_referenced", {
+      bucket_name: bucketName,
+      file_name: path,
+    });
+  } catch {
+    return databaseError();
+  }
+  if (typeof referenced !== "boolean") return databaseError();
+  return referenced;
 }
 
 async function deleteUnusedFiles(request: Request, env: Env): Promise<Response> {
